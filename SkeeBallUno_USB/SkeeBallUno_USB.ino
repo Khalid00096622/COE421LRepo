@@ -1,186 +1,276 @@
 #include <Arduino.h>
 
-// Uno pins. A4 push button to GND (INPUT_PULLUP). No servo is used.
-const byte TRIG[5] = {2, 3, 4, 5, 6};
-const byte ECHO[5] = {7, 8, 9, 10, 11};
+const byte TRIG[] = {2, 3, 4, 5, 6};
+const byte ECHO[] = {7, 8, 9, 10, 11};
+const byte HOLES = sizeof(TRIG) / sizeof(TRIG[0]);
 const byte PASSIVE_BUZZER = 13;
 const byte ACTIVE_BUZZER = A0;
 const byte LED_R = A1, LED_G = A2, LED_B = A3;
 const byte START_BUTTON = A4;
-const unsigned long GAME_MS = 60000UL;
-const unsigned long COUNTDOWN_MS = 5000UL;
-const unsigned long SENSOR_INTERVAL_MS = 65UL; // per ultrasonic ping, sequential
-const unsigned long SCORE_FLASH_MS = 350UL;
-const unsigned long SCORE_BEEP_MS = 100UL;
-const unsigned long BUTTON_DEBOUNCE_MS = 40UL;
-const unsigned long PULSE_TIMEOUT_US = 12000UL;
-const int HIT_DISTANCE_CM = 12; // CALIBRATE for each scoring tunnel
-const int CLEAR_DISTANCE_CM = 18;
-const bool LED_DRIVER_ACTIVE_LOW = false; 
+const bool LED_ACTIVE_LOW = false;
+const bool BUZZER_ACTIVE_LOW = false;
 
-const byte EVT_STARTED = 0x01;
-const byte EVT_ENDED = 0x02;
-const byte EVT_SCORE_BASE = 0x11; 
+const unsigned long COUNTDOWN_MS = 5000;
+const unsigned long GAME_MS = 60000;
+// Ping one sensor at a time. Each hole gets a sample about every 100 ms.
+const unsigned long PING_GAP_MS = 20;
+const unsigned long ECHO_TIMEOUT_US = 3500;
+const byte HIT_CM[HOLES] = {12, 12, 12, 12, 12};
+const byte CLEAR_CM[HOLES] = {18, 18, 18, 18, 18};
+// Enable temporarily for distance calibration. Close Java and use Serial Monitor.
+const bool DIAGNOSTICS = false;
 
-enum Phase { WAITING, COUNTDOWN, PLAYING };
+const byte START = 0x01, FINISH = 0x02, SCORE_BASE = 0x11;
+const byte COUNT_BASE = 0x20, CLOCK_BASE = 0x40;
+enum Phase { WAITING, COUNTDOWN, PLAYING, FINISHED };
 Phase phase = WAITING;
-unsigned long phaseStartedAt = 0;
-unsigned long buttonChangedAt = 0;
-bool buttonLastRaw = HIGH;
-bool buttonStable = HIGH;
-unsigned long lastPingAt = 0;
-unsigned long flashUntil = 0;
-unsigned long activeBeepUntil = 0;
-byte lastCountdownNumber = 0;
-byte nextSensor = 0;
-byte clearReadings[5] = {0, 0, 0, 0, 0};
-bool armed[5] = {true, true, true, true, true};
+unsigned long phaseAt, rawChangedAt, lastPingAt, flashAt, beepAt;
+bool activeBeep = false, flashing = false;
+bool rawButton, stableButton;
+bool armed[HOLES];
+byte clearSamples[HOLES];
+byte nextSensor, lastSecond;
 
-void setRgb(bool red, bool green, bool blue) {
-  digitalWrite(LED_R, (red ^ LED_DRIVER_ACTIVE_LOW) ? HIGH : LOW);
-  digitalWrite(LED_G, (green ^ LED_DRIVER_ACTIVE_LOW) ? HIGH : LOW);
-  digitalWrite(LED_B, (blue ^ LED_DRIVER_ACTIVE_LOW) ? HIGH : LOW);
+struct Note { unsigned int hz, ms; };
+
+
+const Note READY_TUNE[] = {
+{392, 130}, {523, 130}, {659, 130}, {784, 260}
+};
+
+const Note START_TUNE[] = {
+{523, 95}, {659, 95}, {784, 95}, {1047, 300}
+};
+
+const Note FINISH_TUNE[] = {
+{784, 150}, {659, 150}, {523, 150}, {659, 150}, {1047, 430}
+};
+
+const Note BACKGROUND_TUNE[] = {
+{392, 180}, {494, 180}, {587, 180}, {494, 180},
+{440, 180}, {523, 180}, {659, 180}, {523, 180},
+{494, 180}, {587, 180}, {740, 180}, {587, 180},
+{523, 180}, {494, 180}, {440, 180}, {392, 360}
+};
+
+
+
+
+
+const Note* melody = nullptr;
+byte melodyLength, noteIndex;
+unsigned long noteAt;
+unsigned int noteDuration;
+
+void sendByte(byte value) {
+  if (!DIAGNOSTICS) Serial.write(value);
 }
 
-void showScoreColor(byte hole) {
-  switch (hole) {
-    case 0: setRgb(true, false, false); break;   // 10 red
-    case 1: setRgb(false, true, false); break;   // 20 green
-    case 2: setRgb(false, false, true); break;   // 30 blue
-    case 3: setRgb(true, true, false); break;    // 40 yellow
-    case 4: setRgb(true, false, true); break;    // 50 magenta
+void rgb(bool red, bool green, bool blue) {
+  digitalWrite(LED_R, red != LED_ACTIVE_LOW);
+  digitalWrite(LED_G, green != LED_ACTIVE_LOW);
+  digitalWrite(LED_B, blue != LED_ACTIVE_LOW);
+}
+
+void playMelody(const Note* notes, byte count, unsigned long now) {
+  noTone(PASSIVE_BUZZER);
+  melody = notes;
+  melodyLength = count;
+  noteIndex = 0;
+  noteAt = now;
+  noteDuration = 0;
+}
+
+void updateMelody(unsigned long now) {
+  if (!melody || now - noteAt < noteDuration) return;
+  if (noteIndex == melodyLength) {
+    melody = nullptr;
+    return;
   }
+  const Note& note = melody[noteIndex++];
+  tone(PASSIVE_BUZZER, note.hz, note.ms - 25);
+  noteAt = now;
+  noteDuration = note.ms;
 }
 
-void resetSensors() {
-  for (byte i = 0; i < 5; i++) { armed[i] = true; clearReadings[i] = 0; }
-  nextSensor = 0;
-  lastPingAt = millis() - SENSOR_INTERVAL_MS;
-}
-
-void beginCountdown() {
+void startCountdown(unsigned long now) {
   phase = COUNTDOWN;
-  tone(PASSIVE_BUZZER, 1600, 100);
-  phaseStartedAt = millis();
-  lastCountdownNumber = 0;
-  setRgb(true, true, false);
+  phaseAt = now;
+  lastSecond = 0;
+  rgb(true, true, false);
+  playMelody(READY_TUNE, sizeof(READY_TUNE) / sizeof(Note), now);
 }
 
-void startGame() {
-  resetSensors();
+void startGame(unsigned long now) {
   phase = PLAYING;
-  phaseStartedAt = millis();
-  setRgb(false, true, false);
-  Serial.write(EVT_STARTED); 
-  tone(PASSIVE_BUZZER, 1200, 200);
-}
-
-void endGame() {
-  phase = WAITING;
-  Serial.write(EVT_ENDED); 
-  digitalWrite(ACTIVE_BUZZER, LOW);
-  activeBeepUntil = 0;
-  setRgb(false, false, true);
-  tone(PASSIVE_BUZZER, 500, 600);
-}
-
-// Active-low button, debounced.
-void pollStartButton() {
-  bool raw = digitalRead(START_BUTTON);
-  unsigned long now = millis();
-  if (raw != buttonLastRaw) {
-    buttonLastRaw = raw;
-    buttonChangedAt = now;
+  phaseAt = now;
+  nextSensor = 0;
+  lastPingAt = now - PING_GAP_MS;
+  lastSecond = 60;
+  for (byte i = 0; i < HOLES; i++) {
+    armed[i] = true;
+    clearSamples[i] = 0;
   }
-  if (now - buttonChangedAt >= BUTTON_DEBOUNCE_MS && raw != buttonStable) {
-    buttonStable = raw;
-    if (buttonStable == LOW && phase == WAITING) {
-      beginCountdown();
-    }
+  sendByte(START);
+  sendByte(CLOCK_BASE + 60);
+  rgb(false, true, false);
+  playMelody(START_TUNE, sizeof(START_TUNE) / sizeof(Note), now);
+}
+
+void finishGame(unsigned long now) {
+  phase = FINISHED;
+  flashing = false;
+  activeBeep = false;
+  digitalWrite(ACTIVE_BUZZER, BUZZER_ACTIVE_LOW);
+  sendByte(FINISH);
+  rgb(false, false, true);
+  playMelody(FINISH_TUNE, sizeof(FINISH_TUNE) / sizeof(Note), now);
+}
+
+void pollButton(unsigned long now) {
+  bool pressed = digitalRead(START_BUTTON) == LOW;
+  if (pressed != rawButton) {
+    rawButton = pressed;
+    rawChangedAt = now;
+  }
+  if (pressed != stableButton && now - rawChangedAt >= 40) {
+    stableButton = pressed;
+    if (pressed && (phase == WAITING || phase == FINISHED)) startCountdown(now);
   }
 }
 
-void scoreHole(byte hole) {
-  Serial.write((byte)(EVT_SCORE_BASE + hole)); 
-  showScoreColor(hole);
-  flashUntil = millis() + SCORE_FLASH_MS;
-  digitalWrite(ACTIVE_BUZZER, HIGH);
-  activeBeepUntil = millis() + SCORE_BEEP_MS;
-}
-
-int readDistanceCm(byte index) {
-  digitalWrite(TRIG[index], LOW);
+int readDistance(byte hole) {
+  digitalWrite(TRIG[hole], LOW);
   delayMicroseconds(3);
-  digitalWrite(TRIG[index], HIGH);
+  digitalWrite(TRIG[hole], HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG[index], LOW);
-  unsigned long duration = pulseIn(ECHO[index], HIGH, PULSE_TIMEOUT_US);
-  if (duration == 0) return -1; 
-  return (int)(duration / 58UL);
+  digitalWrite(TRIG[hole], LOW);
+  unsigned long duration = pulseIn(ECHO[hole], HIGH, ECHO_TIMEOUT_US);
+  return duration ? int(duration / 58UL) : -1;
 }
 
-void pollOneSensor() {
-  if (millis() - lastPingAt < SENSOR_INTERVAL_MS) return;
-  lastPingAt = millis();
-  byte i = nextSensor;
-  nextSensor = (nextSensor + 1) % 5;
-  int distance = readDistanceCm(i);
-  if (distance >= 2 && distance <= HIT_DISTANCE_CM) {
-    clearReadings[i] = 0;
-    if (armed[i]) { armed[i] = false; scoreHole(i); }
-  } else if (distance >= CLEAR_DISTANCE_CM || distance < 0) {
-    if (clearReadings[i] < 2) clearReadings[i]++;
-    if (clearReadings[i] >= 2) armed[i] = true;
+void scoreHole(byte hole, unsigned long now) {
+  const byte colors[] = {4, 2, 1, 6, 5};
+  byte color = colors[hole];
+  sendByte(SCORE_BASE + hole);
+  rgb(color & 4, color & 2, color & 1);
+  flashing = true;
+  flashAt = now;
+  digitalWrite(ACTIVE_BUZZER, !BUZZER_ACTIVE_LOW);
+  activeBeep = true;
+  beepAt = now;
+}
+
+void pollSensor(unsigned long now) {
+  if (now - lastPingAt < PING_GAP_MS) return;
+  lastPingAt = now;
+  byte hole = nextSensor;
+  nextSensor = (nextSensor + 1) % HOLES;
+  int distance = readDistance(hole);
+  unsigned long sampledAt = millis();
+  if (sampledAt - phaseAt >= GAME_MS) return;
+
+  if (DIAGNOSTICS) {
+    Serial.print(F("Hole "));
+    Serial.print(hole + 1);
+    Serial.print(F(" cm: "));
+    Serial.println(distance);
+  }
+
+  // A distance frame has a hole header and a separately ranged payload.
+  sendByte(0x81 + hole);
+  sendByte(0xA0 + (distance < 0 ? 63 : (distance > 62 ? 62 : distance)));
+
+  if (distance >= 2 && distance <= HIT_CM[hole]) {
+    clearSamples[hole] = 0;
+    if (armed[hole]) {
+      armed[hole] = false;
+      scoreHole(hole, sampledAt);
+    }
+  } else if (distance < 0 || distance >= CLEAR_CM[hole]) {
+    if (clearSamples[hole] < 2) clearSamples[hole]++;
+    if (clearSamples[hole] == 2) armed[hole] = true;
+  } else {
+    clearSamples[hole] = 0;
   }
 }
 
 void setup() {
-  for (byte i = 0; i < 5; i++) {
+  for (byte i = 0; i < HOLES; i++) {
     pinMode(TRIG[i], OUTPUT);
-    pinMode(ECHO[i], INPUT);
     digitalWrite(TRIG[i], LOW);
+    pinMode(ECHO[i], INPUT);
   }
   pinMode(START_BUTTON, INPUT_PULLUP);
-  buttonLastRaw = digitalRead(START_BUTTON);
-  buttonStable = buttonLastRaw;
-  buttonChangedAt = millis();
+  rawButton = stableButton = digitalRead(START_BUTTON) == LOW;
   pinMode(PASSIVE_BUZZER, OUTPUT);
   pinMode(ACTIVE_BUZZER, OUTPUT);
-  pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT); pinMode(LED_B, OUTPUT);
-  digitalWrite(ACTIVE_BUZZER, LOW);
-  setRgb(false, false, false);
+  digitalWrite(ACTIVE_BUZZER, BUZZER_ACTIVE_LOW);
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  rgb(false, false, true);
   Serial.begin(9600);
 }
 
 void loop() {
-  pollStartButton();
-  unsigned long now = millis();
-  if (activeBeepUntil != 0 && (long)(now - activeBeepUntil) >= 0) {
-    digitalWrite(ACTIVE_BUZZER, LOW);
-    activeBeepUntil = 0;
-  }
+unsigned long now = millis();
+pollButton(now);
+updateMelody(now);
 
-  if (phase == COUNTDOWN) {
-    unsigned long elapsed = now - phaseStartedAt;
-    if (elapsed >= COUNTDOWN_MS) {
-      startGame();
-    } else {
-      byte second = (byte)(elapsed / 1000UL) + 1;
-      if (second != lastCountdownNumber) {
-        lastCountdownNumber = second;
-        tone(PASSIVE_BUZZER, 800, 140);
-        setRgb(second % 2 == 0, second % 2 != 0, false);
-      }
-    }
-  } else if (phase == PLAYING) {
-    if (now - phaseStartedAt >= GAME_MS) {
-      endGame();
-    } else {
-      pollOneSensor();
-      if (flashUntil != 0 && (long)(millis() - flashUntil) >= 0) {
-        flashUntil = 0;
-        setRgb(false, true, false);
-      }
-    }
-  }
+if (activeBeep && now - beepAt >= 100) {
+activeBeep = false;
+digitalWrite(ACTIVE_BUZZER, BUZZER_ACTIVE_LOW);
 }
+
+if (flashing && now - flashAt >= 350) {
+flashing = false;
+rgb(false, true, false);
+}
+
+unsigned long elapsed = now - phaseAt;
+
+if (phase == COUNTDOWN) {
+if (elapsed >= COUNTDOWN_MS) {
+startGame(now);
+} else {
+byte remaining = 5 - elapsed / 1000UL;
+if (remaining != lastSecond) {
+lastSecond = remaining;
+sendByte(COUNT_BASE + remaining);
+}
+}
+} else if (phase == PLAYING) {
+if (elapsed >= GAME_MS) {
+finishGame(now);
+} else {
+byte remaining = (GAME_MS - elapsed + 999UL) / 1000UL;
+if (remaining != lastSecond) {
+lastSecond = remaining;
+sendByte(CLOCK_BASE + remaining);
+}
+
+if (melody == nullptr) {
+playMelody(
+BACKGROUND_TUNE,
+sizeof(BACKGROUND_TUNE) / sizeof(BACKGROUND_TUNE[0]),
+now
+);
+}
+
+pollSensor(now);
+}
+}
+}
+
+void testLights() {
+rgb(true, false, false); // Red on A1
+delay(1000);
+
+rgb(false, true, false); // Green on A2
+delay(1000);
+
+rgb(false, false, true); // Blue on A3
+}
+
+
